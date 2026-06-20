@@ -76,6 +76,11 @@ If there are no violations:
 
         content = response.choices[0].message.content
 
+        # Remove markdown code fences
+        content = content.replace("```json", "")
+        content = content.replace("```", "")
+        content = content.strip()
+
         data = json.loads(content)
 
         findings = []
