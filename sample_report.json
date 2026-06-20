@@ -1,0 +1,31 @@
+{
+  "document_name": "Double J Stent — Clinical Evaluation Report",
+  "readiness_score": 71,
+  "summary": "3 potential MDR compliance issues identified.",
+  "findings": [
+    {
+      "violating_statement": "Post-market surveillance data not included in this report.",
+      "guideline_clause": "MDR Article 83 — Post-market surveillance system",
+      "severity": "High",
+      "explanation": "MDR requires a PMS system whose data feed the clinical evaluation; its absence is a gap.",
+      "confidence": 0.86,
+      "suggested_correction": "Add a PMS section summarising complaints, CAPAs and PMCF findings per Articles 83-86."
+    },
+    {
+      "violating_statement": "Clinical investigations: none performed.",
+      "guideline_clause": "MDR Annex XIV Part A — Clinical evaluation plan",
+      "severity": "Critical",
+      "explanation": "Equivalence must be fully documented or a clinical investigation conducted for this device class.",
+      "confidence": 0.78,
+      "suggested_correction": "Provide a complete technical/biological/clinical equivalence demonstration or justify the gap."
+    },
+    {
+      "violating_statement": "Revision Date 26-12-2025.",
+      "guideline_clause": "MDR Annex II — Technical documentation (date control)",
+      "severity": "Low",
+      "explanation": "Document-control dates should be consistent and not post-dated relative to issue.",
+      "confidence": 0.55,
+      "suggested_correction": "Verify the revision date matches the approval workflow and correct any inconsistency."
+    }
+  ]
+}
