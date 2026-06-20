@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 
 from ingest import extract_text, chunk_text
 from retriever import Retriever
@@ -9,7 +10,7 @@ from schema import AuditReport
 def run(
     protocol_path="data/source_file.pdf",
     guideline_path="data/guideline.pdf",
-    max_sections=2
+    max_sections=5
 ):
 
     print("Reading PDFs...")
@@ -18,7 +19,6 @@ def run(
     guideline_text = extract_text(guideline_path)
 
     protocol_chunks = chunk_text(protocol_text)
-
     guideline_chunks = chunk_text(guideline_text)
 
     print(
@@ -56,11 +56,19 @@ def run(
 
     score = readiness_score(all_findings)
 
+    category_counts = Counter()
+
+    for f in all_findings:
+        category_counts[f.category] += 1
+
     report = AuditReport(
         document_name="Clinical Study Protocol",
         findings=all_findings,
         readiness_score=score,
-        summary=f"{len(all_findings)} potential compliance issues found."
+        summary={
+            "total_findings": len(all_findings),
+            "categories": dict(category_counts)
+        }
     )
 
     with open("report.json", "w", encoding="utf-8") as f:
@@ -73,6 +81,10 @@ def run(
     print("\nAudit Complete")
     print(f"Findings: {len(all_findings)}")
     print(f"Readiness Score: {score}/100")
+
+    print("\nCategory Breakdown:")
+    for cat, count in category_counts.items():
+        print(f"{cat}: {count}")
 
     return report
 

@@ -7,7 +7,7 @@ def extract_text(pdf_path: str) -> str:
             parts.append(page.extract_text() or "")
     return "\n".join(parts)
 
-def chunk_text(text: str, words_per_chunk: int = 400, overlap: int = 50):
+def chunk_text(text: str, words_per_chunk: int = 800, overlap: int = 100):
     words = text.split()
     chunks, i = [], 0
     while i < len(words):
