@@ -4,12 +4,15 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from schema import Finding
 
-load_dotenv()
+def get_client():
+    # Force reload environment variables on demand
+    load_dotenv(override=True)
+    api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1"
+    )
 
-client = OpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1"
-)
 
 SEVERITY_WEIGHT = {
     "Critical": 25,
@@ -146,12 +149,15 @@ If there are no violations:
 """
 
     try:
+        client = get_client()
+        model_name = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=model_name,
             messages=[
                 {"role": "system", "content": SYSTEM},
                 {"role": "user", "content": prompt}
             ],
+            response_format={"type": "json_object"},
             temperature=0
         )
 
@@ -176,7 +182,7 @@ If there are no violations:
 
     except Exception as e:
         print("Audit error:", e)
-        return []
+        raise e
 
 
 def readiness_score(findings):
