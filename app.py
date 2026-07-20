@@ -6,6 +6,29 @@ import textwrap
 from schema import AuditReport
 from report import build_html
 
+# Anchor data paths to this file's own directory, not the process's current
+# working directory (which depends on where `streamlit run` was launched from).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Import heavy ML dependencies (sentence-transformers/torch) once at module
+# load time instead of on the first "Run Compliance Audit" click -- these
+# imports alone can take 10-20s the first time, which otherwise shows up as a
+# silent freeze right after clicking the button.
+from ingest import extract_text, extract_pages, chunk_text, quote_locatable
+from retriever import Retriever
+from auditor import audit_section, readiness_score, verify_correction
+
+
+@st.cache_resource(show_spinner=False)
+def get_guideline_retriever(guideline_path: str, mtime: float):
+    """Build (and cache) the guideline retriever once per server process.
+    Recomputing embeddings for the guideline PDF on every single audit was
+    pure wasted time since the guideline never changes between runs.
+    """
+    guideline_text = extract_text(guideline_path)
+    guideline_chunks = chunk_text(guideline_text)
+    return Retriever(guideline_chunks)
+
 # Check query params for home navigation
 if st.query_params.get("screen") == "home":
     st.session_state.current_screen = "home"
@@ -38,6 +61,217 @@ def render_html(html_str):
     # Remove empty lines and leading/trailing whitespace per line to avoid markdown code-block triggers
     clean_html = "\n".join([line.strip() for line in clean_html.split("\n") if line.strip()])
     st.markdown(clean_html, unsafe_allow_html=True)
+
+import html as html_module
+
+def _build_highlighted_page_html(page_text: str, page_findings_idx: list, resolved: dict) -> str:
+    """Build page HTML with finding highlights injected as <mark> tags.
+
+    page_findings_idx: list of (idx, Finding) tuples, where idx is the finding's
+    stable position in report.findings (used as the fix-application id).
+    resolved: dict of {idx: {"verified": bool, "explanation": str}} for findings
+    that have already been applied to this page's text.
+    """
+    escaped = html_module.escape(page_text)
+
+    # --- Unresolved findings: highlight the original flagged text, clickable ---
+    active = [(idx, f) for idx, f in page_findings_idx if idx not in resolved and f.source_quote and f.source_quote.strip()]
+    active.sort(key=lambda t: len(t[1].source_quote), reverse=True)
+
+    for idx, f in active:
+        quote = f.source_quote.strip()
+        escaped_quote = html_module.escape(quote)
+        sev_lower = f.severity.lower()
+        mark_open = f'<mark class="issue-highlight severity-{sev_lower}" data-fid="{idx}" onclick="openAnnotation({idx})">'
+        if escaped_quote in escaped:
+            escaped = escaped.replace(escaped_quote, f'{mark_open}{escaped_quote}</mark>', 1)
+        else:
+            # Fuzzy fallback: match on the first 40 characters
+            prefix = html_module.escape(quote[:40])
+            start = escaped.find(prefix)
+            if start != -1:
+                end = min(start + len(escaped_quote), len(escaped))
+                span = escaped[start:end]
+                escaped = escaped[:start] + mark_open + span + "</mark>" + escaped[end:]
+
+    # --- Resolved findings: highlight the now-applied correction text in green ---
+    fixed = [(idx, f) for idx, f in page_findings_idx if idx in resolved and f.suggested_correction and f.suggested_correction.strip()]
+    fixed.sort(key=lambda t: len(t[1].suggested_correction), reverse=True)
+
+    for idx, f in fixed:
+        corr = f.suggested_correction.strip()
+        escaped_corr = html_module.escape(corr)
+        if escaped_corr in escaped:
+            verified = resolved[idx].get("verified", True)
+            title = "Fix applied and verified compliant" if verified else "Fix applied (verification was inconclusive)"
+            mark = f'<mark class="issue-highlight resolved" title="{title}">'
+            escaped = escaped.replace(escaped_corr, f'{mark}{escaped_corr}</mark>', 1)
+
+    return escaped
+
+
+def _apply_finding_fix(report, resolved, idx, force=False):
+    """Verify (unless forced) and persist a finding's suggested correction into
+    the actual stored page text. Mutates `resolved` and `report.pages` in place."""
+    finding = report.findings[idx]
+    result = {"compliant": True, "explanation": ""}
+    if not force:
+        with st.spinner("Verifying correction against the guideline clause..."):
+            result = verify_correction(
+                source_quote=finding.source_quote or finding.violating_statement,
+                suggested_correction=finding.suggested_correction,
+                guideline_clause=finding.guideline_clause,
+                category=finding.category,
+            )
+
+    if force or result.get("compliant", True):
+        quote = (finding.source_quote or "").strip()
+        target_page = finding.page_number or 1
+        for pg in (report.pages or []):
+            if pg["page_num"] == target_page and quote and quote in pg["text"]:
+                pg["text"] = pg["text"].replace(quote, finding.suggested_correction, 1)
+                break
+        resolved[idx] = {
+            "verified": result.get("compliant", True),
+            "explanation": result.get("explanation", ""),
+        }
+        st.session_state.pop("pending_review", None)
+    else:
+        st.session_state["pending_review"] = {
+            "fidx": idx,
+            "explanation": result.get("explanation", "Verification did not confirm this correction resolves the issue."),
+        }
+
+
+def _render_document_view(report):
+    """Render the interactive document view: issues highlighted inline in the
+    real page text (click a highlight for a quick preview), plus a real,
+    per-issue "Apply Fix" control that verifies the correction against the
+    guideline clause and persists it into the actual stored document text.
+    """
+    resolved = st.session_state.setdefault("resolved_findings", {})
+
+    pages = report.pages or []
+    all_findings = report.findings
+
+    if not pages:
+        st.markdown("""
+        <div class="no-issues-placeholder">
+          <div class="icon">📄</div>
+          <div>Document pages not available.</div>
+          <div style="font-size:13px; margin-top:8px; color:#cbd5e1;">
+            Run a new audit to enable the Document View.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    # Group (idx, finding) tuples by page
+    findings_by_page = {}
+    for idx, f in enumerate(all_findings):
+        pg = f.page_number or 1
+        findings_by_page.setdefault(pg, []).append((idx, f))
+
+    legend_html = """
+    <div style="display:flex; gap:16px; align-items:center; margin-bottom:16px; flex-wrap:wrap;">
+      <span style="font-size:12px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.5px;">Issue Severity:</span>
+      <span style="background:rgba(239,68,68,0.18); color:#ef4444; font-size:12px; font-weight:600; padding:3px 10px; border-radius:4px; border-bottom:2px solid #ef4444;">● Critical</span>
+      <span style="background:rgba(249,115,22,0.18); color:#f97316; font-size:12px; font-weight:600; padding:3px 10px; border-radius:4px; border-bottom:2px solid #f97316;">● High</span>
+      <span style="background:rgba(234,179,8,0.18); color:#ca8a04; font-size:12px; font-weight:600; padding:3px 10px; border-radius:4px; border-bottom:2px solid #eab308;">● Medium</span>
+      <span style="background:rgba(34,197,94,0.18); color:#22c55e; font-size:12px; font-weight:600; padding:3px 10px; border-radius:4px; border-bottom:2px solid #22c55e;">● Low</span>
+      <span style="font-size:12px; color:#94a3b8;">— Highlights show where issues are. Expand an issue below a page to preview and apply its fix.</span>
+    </div>
+    """
+    render_html(legend_html)
+
+    severity_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+    severity_icon = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
+
+    for page_data in pages:
+        pg_num = page_data["page_num"]
+        pg_text = page_data["text"]
+        pg_findings = findings_by_page.get(pg_num, [])
+        active = sorted(
+            [(idx, f) for idx, f in pg_findings if idx not in resolved],
+            key=lambda t: severity_order.get(t[1].severity, 4),
+        )
+        n_resolved = len([1 for idx, _ in pg_findings if idx in resolved])
+
+        if active:
+            issues_badge = f'<span class="doc-issues-count has-issues">{len(active)} issue{"s" if len(active) != 1 else ""}</span>'
+        elif n_resolved > 0:
+            issues_badge = f'<span class="doc-issues-count">✓ All fixed ({n_resolved})</span>'
+        else:
+            issues_badge = '<span class="doc-issues-count">✓ No issues</span>'
+
+        page_body_html = _build_highlighted_page_html(pg_text, pg_findings, resolved)
+        # Rough height estimate so the iframe doesn't clip or over-scroll
+        est_height = 140 + 22 * (len(pg_text) // 80 + pg_text.count("\n") + 1)
+        est_height = max(180, min(est_height, 900))
+
+        page_html = f"""
+<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; padding: 4px; background: transparent; font-family: -apple-system, 'Segoe UI', 'Outfit', sans-serif; }}
+.doc-page-card {{ background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 28px 32px; box-shadow: 0 1px 3px rgba(0,0,0,0.02); font-size: 14.5px; line-height: 1.7; color: #1e293b; white-space: pre-wrap; word-break: break-word; }}
+.doc-page-header {{ display: flex; align-items: center; gap: 10px; margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid #f1f5f9; }}
+.doc-page-number {{ font-size: 11px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }}
+.doc-issues-count {{ font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 20px; background: #f1f5f9; color: #475569; }}
+.doc-issues-count.has-issues {{ background: #fef3c7; color: #92400e; }}
+mark.issue-highlight {{ border-radius: 3px; padding: 1px 2px; text-decoration-line: underline; text-decoration-style: wavy; text-underline-offset: 3px; font-weight: inherit; display: inline; }}
+mark.issue-highlight.severity-critical {{ background-color: rgba(239, 68, 68, 0.18); text-decoration-color: #ef4444; color: inherit; }}
+mark.issue-highlight.severity-high {{ background-color: rgba(249, 115, 22, 0.18); text-decoration-color: #f97316; color: inherit; }}
+mark.issue-highlight.severity-medium {{ background-color: rgba(234, 179, 8, 0.18); text-decoration-color: #eab308; color: inherit; }}
+mark.issue-highlight.severity-low {{ background-color: rgba(34, 197, 94, 0.18); text-decoration-color: #22c55e; color: inherit; }}
+mark.issue-highlight.resolved {{ background-color: rgba(34, 197, 94, 0.14); text-decoration: none; }}
+</style></head><body>
+<div class="doc-page-card">
+  <div class="doc-page-header">
+    <span class="doc-page-number">Page {pg_num}</span>
+    {issues_badge}
+  </div>
+  <div>{page_body_html}</div>
+</div>
+</body></html>
+"""
+        st.iframe(page_html, height=est_height)
+
+        # Native, guaranteed-working preview + apply control for each active issue
+        for idx, f in active:
+            icon = severity_icon.get(f.severity, "⚪")
+            with st.expander(f"{icon} {f.severity} — {f.violating_statement}", expanded=False):
+                st.markdown(
+                    f"<span class='sev-pill sev-pill-{f.severity.lower()}'>{f.severity.upper()}</span> "
+                    f"&nbsp; **{f.guideline_clause}** &nbsp; · &nbsp; Confidence: {int(f.confidence*100)}%",
+                    unsafe_allow_html=True,
+                )
+                if f.source_quote:
+                    st.markdown(f"> {f.source_quote}")
+                st.markdown(f"**Explanation:** {f.explanation}")
+                st.success(f"**Suggested fix:** {f.suggested_correction}")
+
+                pending = st.session_state.get("pending_review")
+                if pending and pending["fidx"] == idx:
+                    st.warning(
+                        f"Verification flagged this correction as not clearly compliant: {pending['explanation']}"
+                    )
+                    if st.button("Apply Anyway", key=f"force_apply_{idx}"):
+                        _apply_finding_fix(report, resolved, idx, force=True)
+                        st.rerun()
+                else:
+                    if st.button("✓ Apply Fix to Document", key=f"apply_{idx}", type="primary"):
+                        _apply_finding_fix(report, resolved, idx, force=False)
+                        st.rerun()
+
+        if n_resolved:
+            fixed_labels = []
+            for idx, f in pg_findings:
+                if idx in resolved:
+                    verified = resolved[idx].get("verified", True)
+                    fixed_labels.append(f"{'✓' if verified else '⚠'} {f.violating_statement}")
+            st.caption("Fixed on this page: " + " · ".join(fixed_labels))
+
+
 
 # Custom CSS matching Stitch AI's premium, state-of-the-art design
 css_style = """
@@ -598,6 +832,308 @@ div[data-testid="stDecoration"] {display: none;}
     line-height: 1.5;
 }
 
+/* =================== DOCUMENT VIEW STYLES =================== */
+.doc-view-container {
+    display: flex;
+    gap: 24px;
+    position: relative;
+    align-items: flex-start;
+}
+.doc-pages-panel {
+    flex: 1 1 65%;
+    min-width: 0;
+}
+.doc-annotation-panel {
+    flex: 0 0 340px;
+    position: sticky;
+    top: 90px;
+    max-height: calc(100vh - 110px);
+    overflow-y: auto;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 16px;
+    padding: 0;
+    box-shadow: 0 4px 24px rgba(11,87,208,0.08);
+    display: none;
+    flex-direction: column;
+}
+.doc-annotation-panel.open {
+    display: flex;
+}
+.doc-annotation-header {
+    padding: 20px 20px 16px 20px;
+    border-bottom: 1px solid #e2e8f0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.doc-annotation-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: #0f172a;
+}
+.doc-annotation-close {
+    cursor: pointer;
+    color: #94a3b8;
+    font-size: 20px;
+    line-height: 1;
+    transition: color 0.2s;
+    background: none;
+    border: none;
+    padding: 0 4px;
+}
+.doc-annotation-close:hover {
+    color: #0f172a;
+}
+.doc-annotation-body {
+    padding: 20px;
+    flex: 1;
+    overflow-y: auto;
+}
+.doc-annotation-severity {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 14px;
+}
+.doc-annotation-clause {
+    font-size: 12px;
+    font-weight: 600;
+    color: #475569;
+    background: #f1f5f9;
+    padding: 4px 10px;
+    border-radius: 6px;
+}
+.doc-annotation-section {
+    margin-bottom: 16px;
+}
+.doc-annotation-section-label {
+    font-size: 11px;
+    font-weight: 700;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+}
+.doc-annotation-section-text {
+    font-size: 14px;
+    color: #334155;
+    line-height: 1.55;
+}
+.doc-annotation-quote {
+    background: #f8fafc;
+    border-left: 3px solid #cbd5e1;
+    border-radius: 0 6px 6px 0;
+    padding: 10px 14px;
+    font-size: 13px;
+    color: #475569;
+    font-style: italic;
+    line-height: 1.5;
+    margin-bottom: 16px;
+}
+.doc-correction-box {
+    background: #f0fdf4;
+    border: 1px solid #bbf7d0;
+    border-radius: 10px;
+    padding: 14px;
+    margin-bottom: 16px;
+}
+.doc-correction-label {
+    font-size: 11px;
+    font-weight: 700;
+    color: #166534;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.doc-correction-text {
+    font-size: 13.5px;
+    color: #166534;
+    line-height: 1.5;
+    font-family: 'Outfit', sans-serif;
+}
+.doc-apply-btn {
+    width: 100%;
+    background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%);
+    color: white;
+    border: none;
+    border-radius: 10px;
+    padding: 12px 20px;
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-family: 'Outfit', sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+.doc-apply-btn:hover {
+    background: linear-gradient(135deg, #16a34a 0%, #15803d 100%);
+    box-shadow: 0 4px 12px rgba(34, 197, 94, 0.3);
+    transform: translateY(-1px);
+}
+.doc-apply-btn:active {
+    transform: translateY(0);
+}
+.doc-dismiss-btn {
+    width: 100%;
+    background: transparent;
+    color: #64748b;
+    border: 1.5px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 10px 20px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-family: 'Outfit', sans-serif;
+}
+.doc-dismiss-btn:hover {
+    background: #f8fafc;
+    border-color: #cbd5e1;
+    color: #334155;
+}
+/* Document page cards */
+.doc-page-card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 16px;
+    padding: 32px 36px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+    font-size: 14.5px;
+    line-height: 1.7;
+    color: #1e293b;
+    font-family: 'Outfit', sans-serif;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.doc-page-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 20px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid #f1f5f9;
+}
+.doc-page-number {
+    font-size: 11px;
+    font-weight: 700;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+.doc-issues-count {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 20px;
+    background: #f1f5f9;
+    color: #475569;
+}
+.doc-issues-count.has-issues {
+    background: #fef3c7;
+    color: #92400e;
+}
+/* Issue highlight marks */
+mark.issue-highlight {
+    border-radius: 3px;
+    padding: 1px 2px;
+    cursor: pointer;
+    transition: filter 0.15s ease, box-shadow 0.15s ease;
+    text-decoration-line: underline;
+    text-decoration-style: wavy;
+    text-underline-offset: 3px;
+    font-weight: inherit;
+    display: inline;
+}
+mark.issue-highlight:hover {
+    filter: brightness(0.92);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+}
+mark.issue-highlight.severity-critical {
+    background-color: rgba(239, 68, 68, 0.18);
+    text-decoration-color: #ef4444;
+    color: inherit;
+}
+mark.issue-highlight.severity-high {
+    background-color: rgba(249, 115, 22, 0.18);
+    text-decoration-color: #f97316;
+    color: inherit;
+}
+mark.issue-highlight.severity-medium {
+    background-color: rgba(234, 179, 8, 0.18);
+    text-decoration-color: #eab308;
+    color: inherit;
+}
+mark.issue-highlight.severity-low {
+    background-color: rgba(34, 197, 94, 0.18);
+    text-decoration-color: #22c55e;
+    color: inherit;
+}
+mark.issue-highlight.resolved {
+    background-color: rgba(34, 197, 94, 0.10);
+    text-decoration: none;
+    cursor: default;
+}
+/* Tab bar for dashboard */
+.tab-bar {
+    display: flex;
+    gap: 4px;
+    background: #f1f5f9;
+    border-radius: 12px;
+    padding: 4px;
+    margin-bottom: 28px;
+    width: fit-content;
+}
+.tab-btn {
+    padding: 8px 20px;
+    border-radius: 9px;
+    font-size: 14px;
+    font-weight: 600;
+    border: none;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    background: transparent;
+    color: #64748b;
+    font-family: 'Outfit', sans-serif;
+}
+.tab-btn.active {
+    background: #ffffff;
+    color: #0f172a;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+.tab-btn:hover:not(.active) {
+    color: #334155;
+    background: rgba(255,255,255,0.6);
+}
+/* Severity pill in annotation panel */
+.sev-pill-critical { background: #fee2e2; color: #ef4444; }
+.sev-pill-high { background: #ffedd5; color: #f97316; }
+.sev-pill-medium { background: #fef9c3; color: #ca8a04; }
+.sev-pill-low { background: #dcfce7; color: #22c55e; }
+.sev-pill {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 4px 10px;
+    border-radius: 6px;
+    text-transform: uppercase;
+    font-family: 'Outfit', sans-serif;
+}
+/* No issues placeholder */
+.no-issues-placeholder {
+    text-align: center;
+    padding: 60px 20px;
+    color: #94a3b8;
+    font-size: 15px;
+}
+.no-issues-placeholder .icon { font-size: 48px; margin-bottom: 16px; }
 /* Custom styling for Streamlit widgets */
 div.stDownloadButton > button {
     background-color: #ffffff !important;
@@ -722,6 +1258,12 @@ if st.session_state.current_screen == "home":
 
     # Options and Run Audit
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+    c_pages = st.columns([1, 2, 1])
+    with c_pages[1]:
+        max_pages_selected = st.slider(
+            "Pages to audit", min_value=5, max_value=10, value=8, step=1,
+            help="Runs locally via Ollama, so this is limited to keep audit time reasonable while we validate the flow.",
+        )
     c_check = st.columns([1, 2, 1])
     with c_check[1]:
         run_real = st.button("Run Compliance Audit", use_container_width=True)
@@ -732,7 +1274,7 @@ if st.session_state.current_screen == "home":
       <div class="feature-card">
         <div class="feature-icon">🤖</div>
         <div class="feature-title">LLM Regulatory Agent</div>
-        <div class="feature-desc">Powered by Groq Llama-3.3-70B model to verify protocol wording and identify hidden regulatory gaps.</div>
+        <div class="feature-desc">Powered by a local Ollama model to verify protocol wording and identify hidden regulatory gaps &mdash; no API rate limits.</div>
       </div>
       <div class="feature-card">
         <div class="feature-icon">🔍</div>
@@ -749,10 +1291,6 @@ if st.session_state.current_screen == "home":
 
     if run_real:
         if cer_file:
-            from ingest import extract_text, chunk_text
-            from retriever import Retriever
-            from auditor import audit_section, readiness_score
-            
             def save(f):
                 t = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
                 t.write(f.read())
@@ -790,7 +1328,14 @@ if st.session_state.current_screen == "home":
                 ("Searching MDR regulatory guidelines", "pending"),
                 ("Running compliance audit with AI models", "pending")
             ]
-            update_status("Starting Compliance Audit...", "~20-30 seconds", audit_steps, 0.1)
+            time_estimate = f"~{max_pages_selected * 15}-{max_pages_selected * 30} seconds (local model)"
+            update_status("Starting Compliance Audit...", time_estimate, audit_steps, 0.1)
+
+            # Native rotating spinner shown the instant the button is clicked,
+            # for feedback while the (now-cached, module-level-imported) audit
+            # pipeline warms up and runs.
+            spinner_cm = st.spinner("Running compliance audit — this can take a few minutes on a local model...")
+            spinner_cm.__enter__()
 
             try:
                 # Step 1: Ingest
@@ -801,66 +1346,99 @@ if st.session_state.current_screen == "home":
                 if len(cer_chunks) == 0:
                     status_placeholder.empty()
                     progress_bar.empty()
+                    spinner_cm.__exit__(None, None, None)
                     st.error("Error: No text could be extracted from the uploaded PDF. Please make sure the PDF contains selectable text (not scanned images without OCR).")
                     st.stop()
                 
                 audit_steps[0] = ("Extracting and chunking Clinical Evaluation Report", "done")
                 audit_steps[1] = ("Searching MDR regulatory guidelines", "active")
-                update_status("Analyzing guidelines...", "~20-30 seconds", audit_steps, 0.3)
+                update_status("Analyzing guidelines...", time_estimate, audit_steps, 0.3)
                 
                 # Step 2: Retrieve from system default guideline
-                guideline_path = "data/guideline.pdf"
+                guideline_path = os.path.join(BASE_DIR, "data", "guideline.pdf")
                 if not os.path.exists(guideline_path):
                     status_placeholder.empty()
                     progress_bar.empty()
+                    spinner_cm.__exit__(None, None, None)
                     st.error("Error: Default guideline.pdf not found in data/ directory.")
                     st.stop()
                     
-                guideline_text = extract_text(guideline_path)
-                guideline_chunks = chunk_text(guideline_text)
-                retriever = Retriever(guideline_chunks)
-                
+                retriever = get_guideline_retriever(guideline_path, os.path.getmtime(guideline_path))
+
                 audit_steps[1] = ("Searching MDR regulatory guidelines", "done")
                 audit_steps[2] = ("Running compliance audit with AI models", "active")
-                update_status("Executing compliance checks...", "~20-30 seconds", audit_steps, 0.5)
+                update_status("Executing compliance checks...", time_estimate, audit_steps, 0.5)
 
-                # Limit sections to exactly 5 sections of 800 words
-                cer_chunks = cer_chunks[:5]
-                    
+                # Extract page-level text for Document View: this scans past any
+                # cover/TOC/abbreviations pages and returns max_pages_selected
+                # pages of real content, starting wherever it actually begins.
+                doc_pages, skipped_pages = extract_pages(cer_path, max_pages=max_pages_selected)
+
+                audit_pages = doc_pages
+                if not audit_pages:
+                    # Fallback: use existing chunks mapped to page 1
+                    audit_pages = [{'page_num': i+1, 'text': c} for i, c in enumerate(cer_chunks[:5])]
+
                 findings = []
-                for idx, sec in enumerate(cer_chunks):
-                    progress_val = 0.5 + 0.5 * ((idx + 1) / len(cer_chunks))
-                    audit_steps[2] = (f"Running compliance audit with AI models (section {idx+1}/{len(cer_chunks)})...", "active")
-                    update_status("Executing compliance checks...", "~20-30 seconds", audit_steps, progress_val)
-                    
+                for idx, page_data in enumerate(audit_pages):
+                    progress_val = 0.5 + 0.5 * ((idx + 1) / len(audit_pages))
+                    sec = page_data['text']
+                    pg = page_data['page_num']
+
+                    audit_steps[2] = (f"Running compliance audit with AI models (page {idx+1}/{len(audit_pages)})...", "active")
+                    update_status("Executing compliance checks...", time_estimate, audit_steps, progress_val)
+
                     clauses = "\n---\n".join(retriever.search(sec, k=3))
-                    findings.extend(audit_section(sec, clauses))
-                
+                    findings.extend(audit_section(sec, clauses, page_number=pg))
+
+                # Drop "phantom" findings whose quote can't actually be located in that
+                # page's text -- these can't be highlighted and just erode trust.
+                page_text_by_num = {p["page_num"]: p["text"] for p in doc_pages}
+                findings = [
+                    f for f in findings
+                    if quote_locatable(page_text_by_num.get(f.page_number or 1, ""), f.source_quote or "")
+                ]
+
                 audit_steps[2] = ("Running compliance audit with AI models", "done")
                 update_status("Audit complete! Redirecting...", "0 seconds", audit_steps, 1.0)
-                
+
                 # Dynamic category counts for summary
                 from collections import Counter
                 category_counts = Counter()
                 for f in findings:
                     category_counts[f.category] += 1
-                
+
                 st.session_state.report = AuditReport(
                     document_name=cer_file.name,
                     findings=findings,
                     readiness_score=readiness_score(findings),
                     summary={
                         "total_findings": len(findings),
-                        "categories": dict(category_counts)
-                    }
+                        "categories": dict(category_counts),
+                        "skipped_pages": skipped_pages,
+                    },
+                    pages=doc_pages
                 )
+                # Clear any resolved/pending state from a previous document
+                st.session_state.resolved_findings = {}
+                st.session_state.pop("pending_review", None)
                 st.session_state.current_screen = "dashboard"
+                spinner_cm.__exit__(None, None, None)
                 st.rerun()
-                
+
             except Exception as e:
+                spinner_cm.__exit__(None, None, None)
                 status_placeholder.empty()
                 progress_bar.empty()
-                st.error(f"Error during compliance audit: {e}\n\nPlease check that your GROQ_API_KEY environment variable is set correctly in your .env file.")
+                err_text = str(e).lower()
+                model_name = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+                if "not found" in err_text and "model" in err_text:
+                    hint = f"The model `{model_name}` hasn't been pulled yet. Run `ollama pull {model_name}` in a terminal, then try again."
+                elif "connection" in err_text or "connect" in err_text:
+                    hint = "Can't reach Ollama. Make sure the Ollama app is running (it should be listed in your system tray/menu bar), or run `ollama serve` in a terminal."
+                else:
+                    hint = f"Make sure the Ollama app is running and that `ollama pull {model_name}` has been run."
+                st.error(f"Error during compliance audit: {e}\n\n{hint}")
         else:
             st.warning("Please upload a Clinical Evaluation Report (PDF) to run the audit.")
 
@@ -923,7 +1501,7 @@ elif st.session_state.current_screen == "dashboard" and st.session_state.report:
           </div>
         </div>
         <div class="sidebar-menu">
-          <div class="sidebar-item active"><span>📊</span> Overview</div>
+          <div class="sidebar-item active"><span>📄</span> Document View</div>
         </div>
         """
         render_html(sidebar_html)
@@ -935,238 +1513,48 @@ elif st.session_state.current_screen == "dashboard" and st.session_state.report:
             st.session_state.report = None
             st.rerun()
 
-    # Dashboard Header
-    render_html("""
-    <div class="dashboard-header">
-      <h1 class="dashboard-title">Audit Results</h1>
-      <p class="dashboard-subtitle">Comprehensive compliance analysis of MDR clinical technical documentation.</p>
-    </div>
-    """)
-
-    # Compute stats dynamically from findings
+    # Dashboard Header + compact summary strip
     total_findings = len(report.findings)
-    avg_confidence = int(sum(f.confidence for f in report.findings) / total_findings * 100) if total_findings else 0
-
-    # Severity stats
     sev_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
     for f in report.findings:
         sev_counts[f.severity] = sev_counts.get(f.severity, 0) + 1
-
     crit_high_count = sev_counts["Critical"] + sev_counts["High"]
-    crit_high_pill = '<span class="metric-card-pill">Requires Attention</span>' if crit_high_count > 0 else ''
-
-    # 0. Executive Summary Card (fills blank spaces, looks extremely premium)
-    summary_text = (
-        f"The technical clinical document achieved a Regulatory Readiness Score of <b>{report.readiness_score:.0f}/100</b>. "
-        f"We identified a total of <b>{total_findings} gaps</b> relative to the EU MDR 2017/745 guidelines. "
-        f"Key areas of exposure are in <b>{', '.join([f'{count} {cat}' for cat, count in sorted(report.summary.get('categories', {}).items(), key=lambda x: x[1], reverse=True)[:2]]) if isinstance(report.summary, dict) and report.summary.get('categories') else 'Clinical Evaluation'}</b>. "
-        f"Immediate action is recommended to resolve the <b>{crit_high_count} High-severity violation(s)</b>."
-    )
-    
-    executive_summary_html = f"""
-    <div class="summary-card">
-      <div class="summary-title">Executive Summary & Key Insights</div>
-      <div class="summary-body">{summary_text}</div>
-    </div>
-    """
-    render_html(executive_summary_html)
-
-    # Circular Readiness Score SVG
     score = int(report.readiness_score)
-    circular_svg = f"""
-    <svg width="68" height="68" viewBox="0 0 36 36">
-      <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#f1f5f9" stroke-width="3.5" />
-      <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#0b57d0" stroke-width="3.5" stroke-dasharray="{score}, 100" stroke-linecap="round" />
-      <text x="18" y="20.35" font-family="'Outfit', sans-serif" font-size="8px" font-weight="bold" text-anchor="middle" fill="#0b57d0">{score}%</text>
-    </svg>
-    """
+    score_color = "#ef4444" if score < 50 else ("#f97316" if score < 75 else "#22c55e")
 
-    # 1. Metrics Grid
-    metrics_grid_html = f"""
-    <div class="metrics-grid">
-      <!-- Card 1: Readiness Score -->
-      <div class="metric-card">
-        <div class="metric-card-left">
-          <div class="metric-card-label">Readiness Score</div>
-          <div class="metric-card-value">{score}/100</div>
-        </div>
-        {circular_svg}
+    skipped_pages = []
+    if isinstance(report.summary, dict):
+        skipped_pages = report.summary.get("skipped_pages", []) or []
+    reviewed_page_nums = [p["page_num"] for p in (report.pages or [])]
+    skipped_note = ""
+    if skipped_pages:
+        skipped_note = (
+            f" &nbsp;·&nbsp; skipped PDF page{'s' if len(skipped_pages) != 1 else ''} "
+            f"{', '.join(str(p) for p in skipped_pages)} (front matter)"
+        )
+    pages_note = ""
+    if reviewed_page_nums:
+        pages_note = f"PDF page{'s' if len(reviewed_page_nums) != 1 else ''} {min(reviewed_page_nums)}-{max(reviewed_page_nums)} reviewed"
+
+    render_html(f"""
+    <div class="dashboard-header">
+      <h1 class="dashboard-title">Audit Results</h1>
+      <p class="dashboard-subtitle">{report.document_name} &nbsp;·&nbsp; {pages_note}{skipped_note}</p>
+    </div>
+    <div style="display:flex; gap:20px; align-items:center; margin-bottom:24px; flex-wrap:wrap;">
+      <div style="background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:14px 20px; display:flex; align-items:center; gap:12px;">
+        <span style="font-size:22px; font-weight:800; color:{score_color};">{score}/100</span>
+        <span style="font-size:12px; color:#64748b; font-weight:600;">READINESS<br>SCORE</span>
       </div>
-
-      <!-- Card 2: Total Findings -->
-      <div class="metric-card">
-        <div class="metric-card-left">
-          <div class="metric-card-label">Total Findings</div>
-          <div class="metric-card-value">{total_findings}</div>
-          <div class="metric-card-subvalue">Across {len(set(f.category for f in report.findings))} major sections</div>
-        </div>
+      <div style="background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:14px 20px;">
+        <span style="font-size:22px; font-weight:800; color:#0f172a;">{total_findings}</span>
+        <span style="font-size:12px; color:#64748b; font-weight:600;"> total findings</span>
       </div>
-
-      <!-- Card 3: Critical + High -->
-      <div class="metric-card">
-        <div class="metric-card-left">
-          <div class="metric-card-label">Critical + High</div>
-          <div style="display: flex; align-items: center;">
-            <span class="metric-card-value">{crit_high_count}</span>
-            {crit_high_pill}
-          </div>
-        </div>
-      </div>
-
-      <!-- Card 4: Avg Confidence -->
-      <div class="metric-card">
-        <div class="metric-card-left" style="width: 100%;">
-          <div class="metric-card-label">Avg Confidence</div>
-          <div class="metric-card-value">{avg_confidence}%</div>
-          <div class="progress-container" style="background:#e2e8f0; height:6px; border-radius:3px; margin-top:12px; overflow:hidden; width: 100%;">
-            <div class="progress-bar" style="width:{avg_confidence}%; background:#0b57d0; height:100%;"></div>
-          </div>
-        </div>
+      <div style="background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:14px 20px;">
+        <span style="font-size:22px; font-weight:800; color:#ef4444;">{crit_high_count}</span>
+        <span style="font-size:12px; color:#64748b; font-weight:600;"> critical + high</span>
       </div>
     </div>
-    """
-    render_html(metrics_grid_html)
+    """)
 
-    # Compute severity percentages for the bar chart
-    if total_findings > 0:
-        crit_pct = (sev_counts["Critical"] / total_findings) * 100
-        high_pct = (sev_counts["High"] / total_findings) * 100
-        med_pct = (sev_counts["Medium"] / total_findings) * 100
-        low_pct = (sev_counts["Low"] / total_findings) * 100
-    else:
-        crit_pct = high_pct = med_pct = low_pct = 0
-
-    severity_bar_html = f"""
-    <div style="display:flex; height:10px; border-radius:5px; overflow:hidden; background:#e2e8f0; margin-bottom:24px; margin-top: 10px;">
-      <div style="width: {crit_pct}%; background: #ef4444;" title="Critical: {sev_counts['Critical']}"></div>
-      <div style="width: {high_pct}%; background: #f97316;" title="High: {sev_counts['High']}"></div>
-      <div style="width: {med_pct}%; background: #eab308;" title="Medium: {sev_counts['Medium']}"></div>
-      <div style="width: {low_pct}%; background: #22c55e;" title="Low: {sev_counts['Low']}"></div>
-    </div>
-    <div style="display:flex; justify-content:space-between; font-size:12px; font-weight:600; color:#64748b; padding: 0 10px;">
-      <span><span style="color:#ef4444; margin-right:6px;">●</span>Critical ({sev_counts['Critical']})</span>
-      <span><span style="color:#f97316; margin-right:6px;">●</span>High ({sev_counts['High']})</span>
-      <span><span style="color:#eab308; margin-right:6px;">●</span>Medium ({sev_counts['Medium']})</span>
-      <span><span style="color:#22c55e; margin-right:6px;">●</span>Low ({sev_counts['Low']})</span>
-    </div>
-    """
-
-    # Category progress bars
-    category_counts = {}
-    for f in report.findings:
-        category_counts[f.category] = category_counts.get(f.category, 0) + 1
-
-    # Sort categories by count descending
-    sorted_categories = sorted(category_counts.items(), key=lambda x: x[1], reverse=True)
-    max_count = max(category_counts.values()) if category_counts else 1
-
-    category_bars_html = ""
-    for cat, count in sorted_categories:
-        pct = (count / max_count) * 100
-        category_bars_html += f"""
-        <div class="category-item">
-          <div class="category-header">
-            <span>{cat}</span>
-            <span>{count}</span>
-          </div>
-          <div class="category-bar-bg">
-            <div class="category-bar-fill" style="width: {pct}%;"></div>
-          </div>
-        </div>
-        """
-
-    # 2. Analytics grid HTML blocks
-    st.markdown('<div class="analytics-grid">', unsafe_allow_html=True)
-    
-    st.markdown('<div class="analytics-card">', unsafe_allow_html=True)
-    st.markdown('<div class="analytics-card-title">Severity Distribution</div>', unsafe_allow_html=True)
-    render_html(severity_bar_html)
-    st.markdown('</div>', unsafe_allow_html=True)
-    
-    st.markdown('<div class="analytics-card">', unsafe_allow_html=True)
-    st.markdown('<div class="analytics-card-title">Issues by Category</div>', unsafe_allow_html=True)
-    render_html(category_bars_html)
-    st.markdown('</div>', unsafe_allow_html=True)
-    
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # 3. Filters wrapper
-    st.markdown('<div class="filter-wrapper">', unsafe_allow_html=True)
-    f_col1, f_col2, f_col3 = st.columns([5, 2, 3])
-    with f_col1:
-        search_query = st.text_input("Search finding or regulation...", placeholder="Search finding or regulation...", label_visibility="collapsed", key="search_query")
-    with f_col2:
-        severity_filter = st.selectbox("Severity", ["All Severities", "Critical", "High", "Medium", "Low"], label_visibility="collapsed", key="severity_filter")
-    with f_col3:
-        confidence_threshold = st.slider("CONFIDENCE THRESHOLD", min_value=0, max_value=100, value=80, step=5, format="%d%%", key="confidence_threshold")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # 4. Filter findings
-    filtered_findings = []
-    for f in report.findings:
-        # Search query matching
-        if search_query:
-            q = search_query.lower()
-            if q not in f.violating_statement.lower() and q not in f.guideline_clause.lower() and q not in f.explanation.lower():
-                continue
-        # Severity matching
-        if severity_filter != "All Severities":
-            if f.severity != severity_filter:
-                continue
-        # Confidence matching
-        if f.confidence * 100 < confidence_threshold:
-            continue
-        filtered_findings.append(f)
-
-    # Sort findings by severity
-    severity_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
-    filtered_findings.sort(key=lambda x: severity_order.get(x.severity, 4))
-
-    # Render findings
-    if filtered_findings:
-        for f in filtered_findings:
-            sev_class = f.severity.lower()
-            conf_pct = int(f.confidence * 100)
-            
-            # Confidence styling
-            conf_class = "low"
-            if conf_pct >= 85:
-                conf_class = "high"
-            elif conf_pct >= 70:
-                conf_class = "medium"
-
-            suggested_fix_html = ""
-            if f.suggested_correction:
-                text = f.suggested_correction
-                if not text.lower().startswith("suggested fix"):
-                    text = f"Suggested fix: {text}"
-                suggested_fix_html = f"""
-                <div class="suggested-fix-box">
-                  <div class="suggested-fix-icon">💡</div>
-                  <div class="suggested-fix-text">{text}</div>
-                </div>
-                """
-
-            card_html = f"""
-            <div class="finding-card" style="border-left: 4px solid {get_severity_color(f.severity)};">
-              <div class="finding-card-header">
-                <div class="finding-card-badges">
-                  <span class="badge-severity {sev_class}">{f.severity}</span>
-                  <span class="badge-clause">{f.guideline_clause}</span>
-                </div>
-                <div class="finding-card-confidence">
-                  <span>CONFIDENCE</span>
-                  <div class="confidence-bar-bg">
-                    <div class="confidence-bar-fill {conf_class}" style="width: {conf_pct}%;"></div>
-                  </div>
-                  <span style="color: #0f172a; font-weight: 700;">{conf_pct}%</span>
-                </div>
-              </div>
-              <div class="finding-card-title">{f.violating_statement}</div>
-              <div class="finding-card-desc">{f.explanation}</div>
-              {suggested_fix_html}
-            </div>
-            """
-            render_html(card_html)
-    else:
-        st.markdown("<div style='text-align:center; padding:40px; color:#64748b;'>No findings match the current filters.</div>", unsafe_allow_html=True)
+    _render_document_view(report)
